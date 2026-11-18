@@ -578,6 +578,14 @@ auto Reader::Slices::fill(uint32 offset, bytes::span buffer) -> FillResult {
 			&& (_headerMode != HeaderMode::Unknown)
 			&& !(_data[sliceIndex].flags & Flag::LoadedFromCache);
 	};
+	auto prefetchedSlice = -1;
+	const auto requestCache = [&](int sliceIndex) {
+		if (cacheNotLoaded(sliceIndex)
+			&& !(_data[sliceIndex].flags & Flag::LoadingFromCache)
+			&& result.sliceNumbersFromCache.add(sliceIndex + 1)) {
+			_data[sliceIndex].flags |= Flag::LoadingFromCache;
+		}
+	};
 	const auto handlePrepareResult = [&](
 			int sliceIndex,
 			const Slice::PrepareFillResult &prepared) {
@@ -586,17 +594,25 @@ auto Reader::Slices::fill(uint32 offset, bytes::span buffer) -> FillResult {
 		}
 		for (const auto offset : prepared.offsetsFromLoader.values()) {
 			const auto full = offset + sliceIndex * kInSlice;
-			if (offset < kInSlice && full < _size) {
-				result.offsetsFromLoader.add(full);
+			if (full >= _size) {
+				continue;
+			}
+			const auto nextSlice = int(full / kInSlice);
+			if (nextSlice > sliceIndex && nextSlice < tillSlice) {
+				continue;
+			}
+			if (nextSlice != sliceIndex) {
+				requestCache(nextSlice);
+				prefetchedSlice = nextSlice;
+			}
+			if (!result.offsetsFromLoader.add(full)) {
+				break;
 			}
 		}
 	};
 	const auto handleReadFromCache = [&](int sliceIndex) {
 		if (cacheNotLoaded(sliceIndex)) {
-			if (!(_data[sliceIndex].flags & Flag::LoadingFromCache)) {
-				_data[sliceIndex].flags |= Flag::LoadingFromCache;
-				result.sliceNumbersFromCache.add(sliceIndex + 1);
-			}
+			requestCache(sliceIndex);
 			result.state = FillState::WaitingCache;
 		}
 	};
@@ -626,6 +642,9 @@ auto Reader::Slices::fill(uint32 offset, bytes::span buffer) -> FillResult {
 		handlePrepareResult(fromSlice + 1, second);
 	}
 	if (first.ready && second.ready) {
+		if (prefetchedSlice >= 0) {
+			markSliceUsed(prefetchedSlice);
+		}
 		markSliceUsed(fromSlice);
 		auto &&list = ranges::make_subrange(first.start, first.finish);
 		CopyLoaded(buffer, list, firstFrom, firstTill);
